@@ -1,0 +1,433 @@
+import os
+import json
+import math
+import pathlib
+import datetime
+import random
+import gc
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from google.colab import drive
+
+class FlowerClassifier:
+    def __init__(self, config):
+        self.config = config
+        self.setup_seeds()
+        self.setup_mixed_precision()
+        self.setup_directories()
+        
+    def setup_seeds(self):
+        random.seed(self.config.SEED)
+        np.random.seed(self.config.SEED)
+        tf.random.set_seed(self.config.SEED)
+    
+    def setup_mixed_precision(self):
+        try:
+            from tensorflow.keras import mixed_precision
+            mixed_precision.set_global_policy("mixed_float16")
+            self.mixed_precision = True
+            print("Mixed precision enabled")
+        except Exception as e:
+            self.mixed_precision = False
+            print(f"Mixed precision not available: {e}")
+    
+    def setup_directories(self):
+        try:
+            drive.mount("/content/drive")
+            print("Google Drive mounted successfully")
+        except Exception as e:
+            print(f"Google Drive mount failed: {e}")
+        
+        self.run_dir = os.path.join(
+            self.config.RUN_ROOT, 
+            f"mbv2_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        os.makedirs(self.run_dir, exist_ok=True)
+        
+        self.model_path = os.path.join(self.run_dir, "flowers5_mbv2.keras")
+        self.meta_path = os.path.join(self.run_dir, "meta.json")
+        self.log_csv = os.path.join(self.run_dir, "train_log.csv")
+        
+        print(f"✅ Run directory: {self.run_dir}")
+    
+    def check_and_download_data(self):
+        if os.path.isdir(self.config.DATA_DIR):
+            print(f"✅ Data directory found: {self.config.DATA_DIR}")
+            return True
+        
+        print(f"⚠️ Data directory not found: {self.config.DATA_DIR}")
+        print("🔄 Attempting to download data...")
+        
+        # Tạo thư mục dữ liệu
+        os.makedirs(self.config.DATA_DIR, exist_ok=True)
+        
+        # Tải dữ liệu mẫu (flowers dataset)
+        try:
+            self.download_flowers_dataset()
+            return True
+        except Exception as e:
+            print(f"❌ Failed to download data: {e}")
+            return False
+    
+    def download_flowers_dataset(self):
+        """Tải dataset flowers từ TensorFlow datasets"""
+        try:
+            import tensorflow_datasets as tfds
+            
+            print("📥 Downloading flowers dataset...")
+            
+            # Tải dataset
+            dataset, info = tfds.load(
+                'tf_flowers',
+                with_info=True,
+                as_supervised=True,
+                shuffle_files=True
+            )
+            
+            # Tạo thư mục class
+            class_names = ['daisy', 'dandelion', 'roses', 'sunflowers', 'tulips']
+            for class_name in class_names:
+                class_dir = os.path.join(self.config.DATA_DIR, class_name)
+                os.makedirs(class_dir, exist_ok=True)
+            
+            # Lưu ảnh vào thư mục (giới hạn số lượng để demo)
+            train_dataset = dataset['train']
+            counter = {class_name: 0 for class_name in class_names}
+            
+            for i, (image, label) in enumerate(train_dataset):
+                if i >= 500:  # Giới hạn số ảnh để demo
+                    break
+                
+                class_name = class_names[label.numpy()]
+                counter[class_name] += 1
+                
+                # Resize và lưu ảnh
+                image = tf.image.resize(image, self.config.IMG_SIZE)
+                image_path = os.path.join(
+                    self.config.DATA_DIR, 
+                    class_name, 
+                    f"{class_name}_{counter[class_name]:04d}.jpg"
+                )
+                
+                tf.keras.utils.save_img(image_path, image.numpy())
+            
+            print("✅ Dataset downloaded and organized successfully")
+            print("📊 Image counts per class:", counter)
+    
+    def load_and_prepare_data(self):
+        if not self.check_and_download_data():
+            raise FileNotFoundError(f"Could not find or download data in: {self.config.DATA_DIR}")
+        
+        # Tải dataset
+        train_raw, val_raw, self.class_names = self.load_datasets()
+        self.num_classes = len(self.class_names)
+        
+        # Tạo datasets với augmentation và preprocessing
+        self.train_ds = self.create_train_dataset(train_raw)
+        self.val_ds = self.create_validation_dataset(val_raw)
+        
+        # Tính class weights
+        self.class_weights = self.calculate_class_weights()
+        
+        # Lưu metadata
+        self.save_metadata()
+        
+        return self.train_ds, self.val_ds
+    
+    def load_datasets(self):
+        train_raw = tf.keras.utils.image_dataset_from_directory(
+            self.config.DATA_DIR, 
+            validation_split=0.2, 
+            subset="training",
+            seed=self.config.SEED, 
+            image_size=self.config.IMG_SIZE, 
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=True, 
+            label_mode="int"
+        )
+        
+        val_raw = tf.keras.utils.image_dataset_from_directory(
+            self.config.DATA_DIR, 
+            validation_split=0.2, 
+            subset="validation",
+            seed=self.config.SEED, 
+            image_size=self.config.IMG_SIZE, 
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=False, 
+            label_mode="int"
+        )
+        
+        print(f"✅ Loaded {len(train_raw.class_names)} classes: {train_raw.class_names}")
+        print(f"✅ Training samples: {len(train_raw.file_paths)}")
+        print(f"✅ Validation samples: {len(val_raw.file_paths)}")
+        
+        return train_raw, val_raw, train_raw.class_names
+    
+    def create_train_dataset(self, raw_dataset):
+        augment = keras.Sequential([
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(0.15),
+            layers.RandomZoom(0.20, 0.20),
+            layers.RandomContrast(0.15),
+            layers.RandomTranslation(0.08, 0.08),
+        ], name="augmentation")
+        
+        def map_fn(x, y):
+            x = augment(x, training=True)
+            x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+            y = tf.one_hot(y, self.num_classes)
+            return x, y
+        
+        return raw_dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)\
+                         .prefetch(tf.data.AUTOTUNE)
+    
+    def create_validation_dataset(self, raw_dataset):
+        def map_fn(x, y):
+            x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+            y = tf.one_hot(y, self.num_classes)
+            return x, y
+        
+        return raw_dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE)\
+                         .prefetch(tf.data.AUTOTUNE)
+    
+    def calculate_class_weights(self):
+        def count_images_per_class(root_dir, classes):
+            counts = []
+            for class_name in classes:
+                class_dir = pathlib.Path(root_dir) / class_name
+                if class_dir.exists():
+                    counts.append(sum(1 for f in class_dir.iterdir() if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg', '.png']))
+                else:
+                    counts.append(0)
+            return counts
+        
+        counts = count_images_per_class(self.config.DATA_DIR, self.class_names)
+        avg_count = sum(counts) / self.num_classes
+        class_weights = {i: float(avg_count / max(count, 1)) for i, count in enumerate(counts)}
+        
+        print("📊 Images per class:", dict(zip(self.class_names, counts)))
+        print("⚖️ Class weights:", class_weights)
+        
+        return class_weights
+    
+    def save_metadata(self):
+        metadata = {
+            "class_names": self.class_names,
+            "img_size": self.config.IMG_SIZE,
+            "arch": "MobileNetV2",
+            "num_classes": self.num_classes,
+            "created_at": datetime.datetime.now().isoformat(),
+            "config": {
+                "batch_size": self.config.BATCH_SIZE,
+                "seed": self.config.SEED,
+                "label_smoothing": self.config.LABEL_SMOOTHING
+            }
+        }
+        
+        with open(self.meta_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        
+        print(f"✅ Metadata saved to: {self.meta_path}")
+    
+    def build_model(self):
+        """Xây dựng model architecture"""
+        print("🔨 Building model...")
+        
+        # Base model
+        base_model = keras.applications.MobileNetV2(
+            include_top=False,
+            weights="imagenet",
+            input_shape=self.config.IMG_SIZE + (3,)
+        )
+        base_model.trainable = False
+        
+        # Custom head
+        inputs = layers.Input(shape=self.config.IMG_SIZE + (3,))
+        x = base_model(inputs, training=False)
+        x = layers.GlobalAveragePooling2D()(x)
+        x = layers.Dropout(0.35)(x)
+        x = layers.Dense(512, activation="relu", 
+                        kernel_regularizer=keras.regularizers.l2(1e-5))(x)
+        x = layers.Dropout(0.35)(x)
+        outputs = layers.Dense(self.num_classes, activation="softmax", 
+                              dtype="float32")(x)  # float32 for stability
+        
+        model = keras.Model(inputs, outputs)
+        print("✅ Model built successfully")
+        return model, base_model
+    
+    def get_optimizer(self, learning_rate, use_adamw=True):
+        """Tạo optimizer"""
+        if use_adamw:
+            try:
+                from tensorflow.keras.optimizers import AdamW
+                return AdamW(learning_rate=learning_rate, 
+                           weight_decay=1e-4 if learning_rate > 1e-4 else 1e-5)
+            except ImportError:
+                print("⚠️ AdamW not available, using Adam")
+        
+        return keras.optimizers.Adam(learning_rate)
+    
+    def get_callbacks(self, phase):
+        """Tạo callbacks cho từng phase training"""
+        callbacks = [
+            keras.callbacks.ModelCheckpoint(
+                self.model_path,
+                monitor="val_accuracy",
+                mode="max",
+                save_best_only=True,
+                verbose=1
+            ),
+            keras.callbacks.EarlyStopping(
+                monitor="val_accuracy",
+                mode="max",
+                patience=12,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor="val_loss",
+                factor=0.5,
+                patience=3,
+                min_lr=1e-6,
+                verbose=1
+            ),
+            keras.callbacks.CSVLogger(self.log_csv, append=True)
+        ]
+        
+        # Learning rate scheduler
+        if phase == "head":
+            lr_scheduler = keras.callbacks.LearningRateScheduler(
+                lambda epoch, lr: self.cosine_annealing(epoch, 3e-4), verbose=0
+            )
+        else:  # fine-tune
+            lr_scheduler = keras.callbacks.LearningRateScheduler(
+                lambda epoch, lr: self.cosine_annealing(epoch, 1e-5), verbose=0
+            )
+        
+        callbacks.append(lr_scheduler)
+        return callbacks
+    
+    def cosine_annealing(self, epoch, base_lr, min_lr=1e-5, period=10):
+        """Cosine annealing learning rate scheduler"""
+        return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * (epoch % period) / period))
+    
+    def train_head(self, model):
+        model.compile(
+            optimizer=self.get_optimizer(3e-4),
+            loss=keras.losses.CategoricalCrossentropy(label_smoothing=self.config.LABEL_SMOOTHING),
+            metrics=["accuracy", keras.metrics.TopKCategoricalAccuracy(k=3)]
+        )
+        
+        print("Starting head training...")
+        history = model.fit(
+            self.train_ds,
+            validation_data=self.val_ds,
+            epochs=self.config.EPOCHS_HEAD,
+            class_weight=self.class_weights,
+            callbacks=self.get_callbacks("head"),
+            verbose=1
+        )
+        
+        return history
+    
+    def fine_tune(self, model, base_model):
+        base_model.trainable = True
+        for layer in base_model.layers[:80]:
+            layer.trainable = False
+        
+        model.compile(
+            optimizer=self.get_optimizer(1e-5),
+            loss=keras.losses.CategoricalCrossentropy(label_smoothing=self.config.LABEL_SMOOTHING),
+            metrics=["accuracy", keras.metrics.TopKCategoricalAccuracy(k=3)]
+        )
+        
+        history = model.fit(
+            self.train_ds,
+            validation_data=self.val_ds,
+            epochs=self.config.EPOCHS_FINE_TUNE,
+            class_weight=self.class_weights,
+            callbacks=self.get_callbacks("fine_tune"),
+            verbose=1
+        )
+        
+        return history
+    
+    def evaluate_model(self, model):
+        val_loss, val_acc, val_top3 = model.evaluate(self.val_ds, verbose=0)
+        print(f"✅ Validation Results:")
+        print(f"   Loss: {val_loss:.4f}")
+        print(f"   Accuracy: {val_acc:.4f}")
+        print(f"   Top-3 Accuracy: {val_top3:.4f}")
+        
+        return val_loss, val_acc, val_top3
+    
+    def train(self):
+        print(f"📁 Data directory: {self.config.DATA_DIR}")
+        print(f"🖼️  Image size: {self.config.IMG_SIZE}")
+        print(f"📦 Batch size: {self.config.BATCH_SIZE}")
+        
+        try:
+            self.load_and_prepare_data()
+            
+            model, base_model = self.build_model()
+            model.summary()
+
+            self.train_head(model)
+ 
+            self.fine_tune(model, base_model)
+            
+            # Đánh giá và lưu model
+            self.evaluate_model(model)
+            model.save(self.model_path)
+            
+            print("✅ Training completed!")
+            print(f"✅ Model saved to: {self.model_path}")
+            print(f"✅ Metadata saved to: {self.meta_path}")
+            print(f"✅ Training log saved to: {self.log_csv}")
+            
+            gc.collect()
+            tf.keras.backend.clear_session()
+            
+            return model
+            
+        except Exception as e:
+            print(f"❌ Training failed: {e}")
+            raise
+
+class TrainingConfig:
+    def __init__(self):
+        self.DATA_DIR = "/content/flowers5/flowers"
+        self.IMG_SIZE = (160, 160)
+        self.BATCH_SIZE = 32
+        self.SEED = 1337
+        self.EPOCHS_HEAD = 25
+        self.EPOCHS_FINE_TUNE = 120
+        self.LABEL_SMOOTHING = 0.06
+        self.RUN_ROOT = "/content/drive/MyDrive/flowers5_runs"
+
+# Alternative config for using TensorFlow Datasets
+class TFDSConfig(TrainingConfig):
+    """Config for using TensorFlow Datasets"""
+    def __init__(self):
+        super().__init__()
+        self.DATA_DIR = "/content/tf_flowers_data"  # Thư mục mới để tránh xung đột
+
+# Main execution
+if __name__ == "__main__":
+    # Tạo config và trainer
+    config = TrainingConfig()
+    trainer = FlowerClassifier(config)
+    
+    # Thực hiện training
+    try:
+        model = trainer.train()
+    except FileNotFoundError:
+        print("\n🔄 Trying alternative approach with TensorFlow Datasets...")
+        
+        # Thử config alternative
+        config = TFDSConfig()
+        trainer = FlowerClassifier(config)
+        model = trainer.train()
