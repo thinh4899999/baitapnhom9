@@ -1,0 +1,205 @@
+# Code giao diện với mapping đã sửa lỗi
+import gradio as gr
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import numpy as np
+import json
+import os
+import glob
+from PIL import Image
+
+# Cài đặt gradio nếu chưa có
+!pip install gradio
+
+class FlowerClassificationFixed:
+    def __init__(self):
+        self.model = None
+        self.class_names = []
+        self.img_size = (160, 160)
+        self.model_path = None
+        
+    def find_latest_model(self):
+        """Tìm model mới nhất"""
+        possible_paths = [
+            "/content/drive/MyDrive/flowers5_runs",
+            "/content",
+            "/content/drive/MyDrive"
+        ]
+        
+        model_files = []
+        for base_path in possible_paths:
+            if os.path.exists(base_path):
+                keras_files = glob.glob(os.path.join(base_path, "**", "*.keras"), recursive=True)
+                h5_files = glob.glob(os.path.join(base_path, "**", "*.h5"), recursive=True)
+                model_files.extend(keras_files + h5_files)
+        
+        if not model_files:
+            return None, None
+        
+        model_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        latest_model = model_files[0]
+        model_dir = os.path.dirname(latest_model)
+        meta_file = os.path.join(model_dir, "meta.json")
+        
+        return latest_model, meta_file if os.path.exists(meta_file) else None
+    
+    def load_model_and_setup(self):
+        """Load model và setup"""
+        print("🔍 Tìm kiếm model đã train...")
+        
+        model_path, meta_path = self.find_latest_model()
+        if not model_path:
+            raise FileNotFoundError("❌ Không tìm thấy model. Hãy chạy code training trước.")
+        
+        print(f"📦 Đã tìm thấy model: {model_path}")
+        
+        try:
+            print("⏳ Đang load model...")
+            self.model = load_model(model_path)
+            print("✅ Model đã load thành công!")
+            
+            self.model_path = model_path
+            self.class_names = ['daisy', 'dandelion', 'roses', 'sunflowers', 'tulips']
+            
+            print(f"📊 Thông tin model:")
+            print(f"   Input shape: {self.model.input_shape}")
+            print(f"   Output shape: {self.model.output_shape}")
+            print(f"   Classes: {self.class_names}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Lỗi khi load model: {e}")
+            return False
+    
+    def preprocess_image(self, image):
+        """Tiền xử lý ảnh theo format của model"""
+        if isinstance(image, Image.Image):
+            img_array = np.array(image)
+        else:
+            img_array = image
+        
+        # Resize về kích thước model mong đợi
+        img_resized = tf.image.resize(img_array, self.img_size)
+        
+        # Preprocessing theo MobileNetV2
+        img_preprocessed = tf.keras.applications.mobilenet_v2.preprocess_input(img_resized)
+        
+        # Thêm batch dimension
+        img_batch = tf.expand_dims(img_preprocessed, 0)
+        
+        return img_batch
+    
+    def predict_flower(self, image):
+        if self.model is None:
+            return "❌ Model chưa được load. Vui lòng chạy lại setup."
+        
+        try:
+            # Tiền xử lý ảnh
+            processed_image = self.preprocess_image(image)
+            
+            # Dự đoán
+            predictions = self.model.predict(processed_image, verbose=0)
+            raw_predictions = predictions[0]
+            
+
+            
+            corrected_results = {}
+
+            corrected_results['daisy'] = float(raw_predictions[1])     
+            corrected_results['dandelion'] = float(raw_predictions[0]) 
+            corrected_results['roses'] = float(raw_predictions[4])     
+            corrected_results['tulips'] = float(raw_predictions[2])     
+            corrected_results['sunflowers'] = float(raw_predictions[3]) 
+            
+            print(f"Raw predictions: {[f'{x:.3f}' for x in raw_predictions]}")
+            print(f"Corrected mapping: {corrected_results}")
+            
+            return corrected_results
+            
+        except Exception as e:
+            return f"❌ Lỗi trong quá trình dự đoán: {str(e)}"
+    
+    def create_interface(self):
+        """Tạo giao diện Gradio"""
+        
+        custom_css = """
+        .gradio-container {
+            max-width: 900px;
+            margin: auto;
+            padding: 20px;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        .title {
+            text-align: center;
+            color: #2d3748;
+            font-weight: bold;
+        }
+        """
+        
+        model_info = f"""
+        ### 🤖
+        """
+        
+        interface = gr.Interface(
+            fn=self.predict_flower,
+            inputs=[
+                gr.Image(
+                    type="pil", 
+                    label="📸 Upload ảnh hoa để nhận diện",
+                    height=400
+                )
+            ],
+            outputs=[
+                gr.Label(
+                    num_top_classes=5, 
+                    label="🎯 Kết quả nhận diện",
+                    show_label=True
+                )
+            ],
+            title="🌸 Nhận Diện Hoa",
+            description="""
+            """,
+            article=model_info,
+            theme=gr.themes.Soft(),
+            css=custom_css
+        )
+        
+        return interface
+
+# Hàm chính để chạy giao diện
+def main():
+    print("🚀 Khởi tạo giao diện nhận diện hoa...")
+    print("="*60)
+    
+    try:
+        flower_interface = FlowerClassificationFixed()
+        
+        if not flower_interface.load_model_and_setup():
+            print("❌ Không thể load model")
+            return
+        
+        print("\n" + "="*60)
+        print("🎨 Tạo giao diện web...")
+        
+        demo = flower_interface.create_interface()
+        
+        print("🌐 Khởi động giao diện...")
+        demo.launch(
+            share=True,
+            debug=True,
+            inbrowser=True,
+            server_name="0.0.0.0",
+            server_port=7862  # Port khác để tránh conflict
+        )
+        
+        print("\n" + "="*60)
+        print("🎉 Giao diện khởi động thành công!")
+        print("="*60)
+        
+    except Exception as e:
+        print(f"❌ Lỗi khởi tạo: {e}")
+
+# Chạy giao diện
+if __name__ == "__main__":
+    main()
